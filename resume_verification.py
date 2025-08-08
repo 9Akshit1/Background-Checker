@@ -1,13 +1,16 @@
 import requests
-from bs4 import BeautifulSoup
-import time
-import re
 import json
-from urllib.parse import quote_plus, urljoin
-from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
+import time
 import logging
-import random
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+import os
+from urllib.parse import quote_plus
+from dotenv import load_dotenv
+from datetime import datetime
+import re
+
+load_dotenv()
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -18,524 +21,1198 @@ class PersonInfo:
     name: str
     region: str
     school: str
-    work_experiences: List[Dict[str, str]]  # [{"company": "...", "role": "..."}]
-    supervisor_contacts: Optional[Dict[str, str]] = None  # {"email": "...", "phone": "..."}
+    work_experiences: List[Dict[str, str]]
+    supervisor_contacts: Optional[Dict[str, str]] = None
+    date_of_birth: Optional[str] = None  # For criminal background checks
+    ssn_last_4: Optional[str] = None     # Optional, for better matching
 
 @dataclass
 class VerificationResult:
     school_verification: Dict[str, any]
     work_verification: List[Dict[str, any]]
     social_media_findings: Dict[str, List[str]]
+    criminal_background_check: Dict[str, any]
     prepared_emails: List[str]
     confidence_score: float
+    verification_sources: List[str]
+    report_summary: str
 
-class ResumeVerifier:
-    def __init__(self):
+class EnhancedResumeVerifier:
+    def __init__(self, api_keys: Dict[str, str] = None):
+        """
+        Initialize with API keys for various services
+        api_keys should contain:
+        - 'serp_api': SerpApi key for Google search
+        - 'rapidapi': RapidAPI key for various APIs
+        - 'hunter': Hunter.io API for company verification
+        - 'clearbit': Clearbit API for company information
+        - 'pipl': Pipl API for people search
+        - 'truthfinder': TruthFinder API for background checks
+        """
+        self.api_keys = api_keys or {}
         self.session = requests.Session()
-        # Rotate user agents to appear more human-like
-        user_agents = [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
-        ]
-        self.session.headers.update({
-            'User-Agent': random.choice(user_agents),
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-        })
+        self.verification_sources = []
         
-    def search_bing(self, query: str, num_results: int = 10) -> List[Dict[str, str]]:
-        """Use Bing search (more permissive than Google/DuckDuckGo)"""
+    def search_with_serpapi(self, query: str, num_results: int = 10) -> List[Dict[str, str]]:
+        """Use SerpApi for reliable Google search results"""
+        if 'serp_api' not in self.api_keys:
+            logger.warning("No SerpApi key provided - using fallback method")
+            return self._fallback_search(query, num_results)
+        
         try:
-            # Bing search URL
-            url = f"https://www.bing.com/search?q={quote_plus(query)}&count={num_results}"
+            url = "https://serpapi.com/search"
+            params = {
+                'q': query,
+                'api_key': self.api_keys['serp_api'],
+                'engine': 'google',
+                'num': num_results,
+                'gl': 'ca',  # Canada results
+                'hl': 'en'   # English language
+            }
             
-            # Add random delay to appear more human-like
-            time.sleep(random.uniform(1, 3))
-            
-            response = self.session.get(url, timeout=10)
+            response = self.session.get(url, params=params, timeout=10)
             response.raise_for_status()
             
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
+            data = response.json()
             results = []
-            # Bing's result selectors
-            for result in soup.find_all('li', class_='b_algo')[:num_results]:
-                title_elem = result.find('h2')
-                link_elem = result.find('a')
-                
-                if title_elem and link_elem:
-                    title = title_elem.get_text().strip()
-                    link = link_elem.get('href')
-                    if link and title and link.startswith('http'):
-                        results.append({'title': title, 'url': link})
-                        logger.info(f"Found result: {title[:50]}...")
             
-            logger.info(f"Found {len(results)} results for query: {query}")
+            for result in data.get('organic_results', []):
+                results.append({
+                    'title': result.get('title', ''),
+                    'url': result.get('link', ''),
+                    'snippet': result.get('snippet', '')
+                })
+                
+            logger.info(f"SerpApi found {len(results)} results for: {query}")
             return results
             
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Network error during search: {e}")
-            return []
         except Exception as e:
-            logger.error(f"Search error: {e}")
-            return []
-    
-    def search_direct_sites(self, person_name: str, additional_terms: str = "") -> List[Dict[str, str]]:
-        """Search specific sites directly"""
-        results = []
-        
-        # LinkedIn direct search (more reliable than site: operator)
-        try:
-            linkedin_query = f"https://www.bing.com/search?q={quote_plus(f'{person_name} {additional_terms} linkedin')}"
-            response = self.session.get(linkedin_query, timeout=10)
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            for result in soup.find_all('li', class_='b_algo'):
-                link_elem = result.find('a')
-                title_elem = result.find('h2')
-                
-                if link_elem and title_elem:
-                    url = link_elem.get('href', '')
-                    title = title_elem.get_text().strip()
-                    
-                    if 'linkedin.com' in url and person_name.lower() in title.lower():
-                        results.append({'title': title, 'url': url, 'source': 'linkedin'})
-                        
-            time.sleep(random.uniform(2, 4))
-            
-        except Exception as e:
-            logger.error(f"LinkedIn search error: {e}")
-        
-        return results
-    
-    def verify_school_attendance(self, person_name: str, school: str, region: str) -> Dict[str, any]:
-        """Verify school attendance through multiple sources"""
-        logger.info(f"Verifying school attendance: {person_name} at {school}")
-        
-        verification = {
+            logger.error(f"SerpApi search failed: {e}")
+            return self._fallback_search(query, num_results)
+
+    def verify_company_comprehensive(self, company_name: str, domain: str = None) -> Dict[str, any]:
+        """
+        Comprehensive company verification using multiple sources
+        """
+        verification_results = {
             'verified': False,
-            'sources': [],
             'confidence': 0.0,
+            'sources': [],
+            'company_info': {'name': company_name}
+        }
+        
+        # Method 1: Hunter.io verification
+        hunter_result = self._verify_with_hunter(company_name, domain)
+        if hunter_result['verified']:
+            verification_results['confidence'] += 0.3
+            verification_results['sources'].append('Hunter.io')
+            verification_results['company_info'].update(hunter_result.get('company_info', {}))
+        
+        # Method 2: Search for company official website
+        website_result = self._verify_company_website(company_name)
+        if website_result['verified']:
+            verification_results['confidence'] += 0.25
+            verification_results['sources'].append('Official Website')
+            verification_results['company_info'].update(website_result.get('company_info', {}))
+        
+        # Method 3: Better Business Bureau search
+        bbb_result = self._search_bbb(company_name)
+        if bbb_result['found']:
+            verification_results['confidence'] += 0.15
+            verification_results['sources'].append('Better Business Bureau')
+            verification_results['company_info']['bbb_rating'] = bbb_result.get('rating')
+        
+        # Method 4: SEC filings search (for public companies)
+        sec_result = self._search_sec_filings(company_name)
+        if sec_result['found']:
+            verification_results['confidence'] += 0.2
+            verification_results['sources'].append('SEC Filings')
+            verification_results['company_info']['public_company'] = True
+        
+        # Method 5: Companies House search (for UK companies)
+        if 'uk' in company_name.lower() or 'ltd' in company_name.lower():
+            ch_result = self._search_companies_house(company_name)
+            if ch_result['found']:
+                verification_results['confidence'] += 0.2
+                verification_results['sources'].append('Companies House UK')
+        
+        # Method 6: Crunchbase verification
+        crunchbase_result = self._search_crunchbase(company_name)
+        if crunchbase_result['found']:
+            verification_results['confidence'] += 0.1
+            verification_results['sources'].append('Crunchbase')
+        
+        verification_results['verified'] = verification_results['confidence'] > 0.4
+        self.verification_sources.extend(verification_results['sources'])
+        
+        return verification_results
+
+    def _verify_with_hunter(self, company_name: str, domain: str = None) -> Dict[str, any]:
+        """Verify company using Hunter.io API"""
+        if 'hunter' not in self.api_keys:
+            return {'verified': False, 'reason': 'No Hunter.io API key'}
+        
+        try:
+            if not domain:
+                domain = self._guess_company_domain(company_name)
+            
+            url = "https://api.hunter.io/v2/domain-search"
+            params = {
+                'domain': domain,
+                'api_key': self.api_keys['hunter'],
+                'limit': 10
+            }
+            
+            response = self.session.get(url, params=params, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('data'):
+                    company_data = data['data']
+                    return {
+                        'verified': True,
+                        'company_info': {
+                            'name': company_data.get('organization'),
+                            'domain': company_data.get('domain'),
+                            'industry': company_data.get('industry'),
+                            'country': company_data.get('country'),
+                            'employee_estimate': company_data.get('emails', 0)
+                        }
+                    }
+            
+            return {'verified': False, 'reason': 'Company not found in Hunter.io'}
+                
+        except Exception as e:
+            logger.error(f"Hunter.io verification failed: {e}")
+            return {'verified': False, 'reason': f'Hunter.io error: {str(e)}'}
+
+    def _verify_company_website(self, company_name: str) -> Dict[str, any]:
+        """Verify company by finding official website"""
+        try:
+            search_query = f'"{company_name}" official website'
+            search_results = self.search_with_serpapi(search_query, 5)
+            
+            official_websites = []
+            for result in search_results:
+                url = result.get('url', '').lower()
+                title = result.get('title', '').lower()
+                
+                # Look for official website indicators
+                if any(indicator in url for indicator in ['.com', '.org', '.net', '.co', '.ca']) and \
+                   any(word in title for word in company_name.lower().split()):
+                    official_websites.append({
+                        'url': result['url'],
+                        'title': result['title']
+                    })
+            
+            return {
+                'verified': len(official_websites) > 0,
+                'company_info': {
+                    'official_websites': official_websites[:3]
+                }
+            }
+            
+        except Exception as e:
+            return {'verified': False, 'reason': f'Website search error: {str(e)}'}
+
+    def _search_bbb(self, company_name: str) -> Dict[str, any]:
+        """Search Better Business Bureau for company"""
+        try:
+            search_query = f'"{company_name}" site:bbb.org'
+            search_results = self.search_with_serpapi(search_query, 3)
+            
+            bbb_found = any('bbb.org' in r.get('url', '') for r in search_results)
+            
+            rating = None
+            if bbb_found and search_results:
+                # Try to extract rating from snippet
+                for result in search_results:
+                    snippet = result.get('snippet', '')
+                    rating_match = re.search(r'([A-F][+-]?)\s*rating', snippet, re.IGNORECASE)
+                    if rating_match:
+                        rating = rating_match.group(1)
+                        break
+            
+            return {
+                'found': bbb_found,
+                'rating': rating,
+                'results': search_results[:2] if bbb_found else []
+            }
+            
+        except Exception as e:
+            return {'found': False, 'error': str(e)}
+
+    def _search_sec_filings(self, company_name: str) -> Dict[str, any]:
+        """Search SEC EDGAR database for public company filings"""
+        try:
+            search_query = f'"{company_name}" site:sec.gov'
+            search_results = self.search_with_serpapi(search_query, 3)
+            
+            sec_found = any('sec.gov' in r.get('url', '') for r in search_results)
+            
+            return {
+                'found': sec_found,
+                'filings': search_results[:2] if sec_found else []
+            }
+            
+        except Exception as e:
+            return {'found': False, 'error': str(e)}
+
+    def _search_companies_house(self, company_name: str) -> Dict[str, any]:
+        """Search UK Companies House for company registration"""
+        try:
+            search_query = f'"{company_name}" site:find-and-update.company-information.service.gov.uk'
+            search_results = self.search_with_serpapi(search_query, 3)
+            
+            ch_found = any('company-information.service.gov.uk' in r.get('url', '') for r in search_results)
+            
+            return {
+                'found': ch_found,
+                'registration': search_results[:2] if ch_found else []
+            }
+            
+        except Exception as e:
+            return {'found': False, 'error': str(e)}
+
+    def _search_crunchbase(self, company_name: str) -> Dict[str, any]:
+        """Search Crunchbase for company information"""
+        try:
+            search_query = f'"{company_name}" site:crunchbase.com'
+            search_results = self.search_with_serpapi(search_query, 2)
+            
+            cb_found = any('crunchbase.com' in r.get('url', '') for r in search_results)
+            
+            return {
+                'found': cb_found,
+                'profile': search_results[:1] if cb_found else []
+            }
+            
+        except Exception as e:
+            return {'found': False, 'error': str(e)}
+
+    def verify_education_comprehensive(self, person_info: PersonInfo) -> Dict[str, any]:
+        """
+        Comprehensive education verification using multiple sources
+        """
+        verification_results = {
+            'verified': False,
+            'confidence': 0.0,
+            'sources': [],
             'evidence': []
         }
         
-        # Improved search queries
+        # Method 1: Alumni directories and graduation lists
+        alumni_result = self._search_alumni_records(person_info)
+        if alumni_result['found']:
+            verification_results['confidence'] += 0.4
+            verification_results['sources'].append('Alumni Records')
+            verification_results['evidence'].extend(alumni_result['evidence'])
+        
+        # Method 2: Academic publications and research
+        academic_result = self._search_academic_publications(person_info)
+        if academic_result['found']:
+            verification_results['confidence'] += 0.3
+            verification_results['sources'].append('Academic Publications')
+            verification_results['evidence'].extend(academic_result['evidence'])
+        
+        # Method 3: University news and press releases
+        news_result = self._search_university_news(person_info)
+        if news_result['found']:
+            verification_results['confidence'] += 0.2
+            verification_results['sources'].append('University News')
+            verification_results['evidence'].extend(news_result['evidence'])
+        
+        # Method 4: Professional licensing boards (if applicable)
+        license_result = self._search_professional_licenses(person_info)
+        if license_result['found']:
+            verification_results['confidence'] += 0.3
+            verification_results['sources'].append('Professional Licensing')
+            verification_results['evidence'].extend(license_result['evidence'])
+        
+        verification_results['verified'] = verification_results['confidence'] > 0.3
+        self.verification_sources.extend(verification_results['sources'])
+        
+        return verification_results
+
+    def _search_alumni_records(self, person_info: PersonInfo) -> Dict[str, any]:
+        """Search for alumni records and graduation announcements"""
         queries = [
-            f'"{person_name}" "{school}" graduate',
-            f'"{person_name}" "{school}" alumni',
-            f'"{person_name}" "{school}" degree',
-            f'{person_name} {school} student',
-            f'{person_name} university western ontario',  # More specific for this case
+            f'"{person_info.name}" "{person_info.school}" graduate alumni',
+            f'"{person_info.name}" "{person_info.school}" degree graduation',
+            f'{person_info.name} {person_info.school} alumni directory'
         ]
         
-        evidence_count = 0
-        
+        all_evidence = []
         for query in queries:
-            try:
-                logger.info(f"Searching: {query}")
-                results = self.search_bing(query, 8)
-                
-                for result in results:
-                    title_lower = result['title'].lower()
-                    name_parts = person_name.lower().split()
-                    school_keywords = school.lower().split()
-                    
-                    # Check for name and school matches
-                    name_match = any(part in title_lower for part in name_parts if len(part) > 2)
-                    school_match = any(keyword in title_lower for keyword in school_keywords if len(keyword) > 3)
-                    
-                    if name_match and school_match:
-                        verification['sources'].append(result['url'])
-                        verification['evidence'].append({
-                            'type': 'search_result',
-                            'title': result['title'],
-                            'url': result['url'],
-                            'relevance': 'high' if name_match and school_match else 'medium'
-                        })
-                        evidence_count += 1
-                        logger.info(f"Found relevant result: {result['title'][:60]}...")
-                
-                # Longer delay between searches
-                time.sleep(random.uniform(3, 6))
-                
-            except Exception as e:
-                logger.error(f"School verification error for query '{query}': {e}")
+            results = self.search_with_serpapi(query, 3)
+            for result in results:
+                if self._is_education_relevant(result, person_info.name, person_info.school):
+                    all_evidence.append(result)
+            time.sleep(1)
         
-        # Calculate confidence based on evidence found
-        verification['confidence'] = min(evidence_count / 2.0, 1.0)  # More realistic threshold
-        verification['verified'] = verification['confidence'] > 0.25
+        return {
+            'found': len(all_evidence) > 0,
+            'evidence': all_evidence
+        }
+
+    def _search_academic_publications(self, person_info: PersonInfo) -> Dict[str, any]:
+        """Search for academic publications and research papers"""
+        queries = [
+            f'"{person_info.name}" "{person_info.school}" research paper',
+            f'"{person_info.name}" "{person_info.school}" publication thesis',
+            f'{person_info.name} {person_info.school} site:researchgate.net OR site:scholar.google.com'
+        ]
         
-        logger.info(f"School verification complete. Evidence count: {evidence_count}, Confidence: {verification['confidence']:.2%}")
-        return verification
-    
-    def verify_work_experience(self, person_name: str, company: str, role: str) -> Dict[str, any]:
-        """Verify work experience through multiple sources"""
-        logger.info(f"Verifying work experience: {person_name} at {company} as {role}")
+        all_evidence = []
+        for query in queries:
+            results = self.search_with_serpapi(query, 3)
+            for result in results:
+                if any(site in result.get('url', '') for site in ['researchgate', 'scholar.google', 'academia.edu']):
+                    all_evidence.append(result)
+            time.sleep(1)
         
-        verification = {
+        return {
+            'found': len(all_evidence) > 0,
+            'evidence': all_evidence
+        }
+
+    def _search_university_news(self, person_info: PersonInfo) -> Dict[str, any]:
+        """Search university news and press releases"""
+        school_domain = self._guess_school_domain(person_info.school)
+        queries = [
+            f'"{person_info.name}" site:{school_domain}',
+            f'"{person_info.name}" "{person_info.school}" graduation ceremony',
+            f'"{person_info.name}" "{person_info.school}" dean\'s list honor'
+        ]
+        
+        all_evidence = []
+        for query in queries:
+            results = self.search_with_serpapi(query, 3)
+            all_evidence.extend(results)
+            time.sleep(1)
+        
+        return {
+            'found': len(all_evidence) > 0,
+            'evidence': all_evidence
+        }
+
+    def _search_professional_licenses(self, person_info: PersonInfo) -> Dict[str, any]:
+        """Search for professional licenses and certifications"""
+        # Common professional licensing sites
+        license_sites = [
+            'site:cpacanada.ca',  # Canadian CPAs
+            'site:peo.on.ca',     # Professional Engineers Ontario
+            'site:lsac.on.ca',    # Law Society
+            'site:cpso.on.ca',    # College of Physicians
+        ]
+        
+        all_evidence = []
+        for site in license_sites:
+            query = f'"{person_info.name}" {site}'
+            results = self.search_with_serpapi(query, 2)
+            all_evidence.extend(results)
+            time.sleep(1)
+        
+        return {
+            'found': len(all_evidence) > 0,
+            'evidence': all_evidence
+        }
+
+    def criminal_background_check(self, person_info: PersonInfo) -> Dict[str, any]:
+        """
+        Comprehensive criminal background check using multiple sources
+        """
+        background_results = {
+            'clean_record': True,
+            'confidence': 0.0,
+            'sources_checked': [],
+            'findings': [],
+            'warnings': []
+        }
+        
+        # Method 1: Court records search
+        court_result = self._search_court_records(person_info)
+        background_results['sources_checked'].append('Court Records')
+        if court_result['found']:
+            background_results['clean_record'] = False
+            background_results['findings'].extend(court_result['findings'])
+        
+        # Method 2: Sex offender registry
+        sex_offender_result = self._search_sex_offender_registry(person_info)
+        background_results['sources_checked'].append('Sex Offender Registry')
+        if sex_offender_result['found']:
+            background_results['clean_record'] = False
+            background_results['findings'].extend(sex_offender_result['findings'])
+        
+        # Method 3: Bankruptcy records
+        bankruptcy_result = self._search_bankruptcy_records(person_info)
+        background_results['sources_checked'].append('Bankruptcy Records')
+        if bankruptcy_result['found']:
+            background_results['findings'].extend(bankruptcy_result['findings'])
+        
+        # Method 4: Professional sanctions
+        sanctions_result = self._search_professional_sanctions(person_info)
+        background_results['sources_checked'].append('Professional Sanctions')
+        if sanctions_result['found']:
+            background_results['findings'].extend(sanctions_result['findings'])
+        
+        # Method 5: News articles about legal issues
+        news_result = self._search_legal_news(person_info)
+        background_results['sources_checked'].append('Legal News')
+        if news_result['found']:
+            background_results['findings'].extend(news_result['findings'])
+        
+        # Calculate confidence based on sources checked
+        background_results['confidence'] = min(len(background_results['sources_checked']) / 5.0, 1.0)
+        
+        # Add warning if person matching is uncertain
+        if not person_info.date_of_birth and not person_info.ssn_last_4:
+            background_results['warnings'].append(
+                "Person matching may be uncertain without DOB or SSN - results may include other individuals with same name"
+            )
+        
+        self.verification_sources.extend(background_results['sources_checked'])
+        return background_results
+
+    def _search_court_records(self, person_info: PersonInfo) -> Dict[str, any]:
+        """Search public court records"""
+        queries = [
+            f'"{person_info.name}" court records {person_info.region}',
+            f'"{person_info.name}" criminal case {person_info.region}',
+            f'"{person_info.name}" arrest {person_info.region}'
+        ]
+        
+        findings = []
+        for query in queries:
+            results = self.search_with_serpapi(query, 3)
+            for result in results:
+                if any(keyword in result.get('snippet', '').lower() for keyword in 
+                      ['court', 'criminal', 'arrest', 'conviction', 'sentenced']):
+                    findings.append({
+                        'type': 'Court Record',
+                        'source': result['url'],
+                        'description': result['snippet']
+                    })
+            time.sleep(1)
+        
+        return {
+            'found': len(findings) > 0,
+            'findings': findings
+        }
+
+    def _search_sex_offender_registry(self, person_info: PersonInfo) -> Dict[str, any]:
+        """Search sex offender registries"""
+        # Canadian sex offender registry is not public, but we can search news
+        queries = [
+            f'"{person_info.name}" sex offender registry {person_info.region}',
+            f'"{person_info.name}" sexual offense {person_info.region}'
+        ]
+        
+        findings = []
+        for query in queries:
+            results = self.search_with_serpapi(query, 2)
+            for result in results:
+                if any(keyword in result.get('snippet', '').lower() for keyword in 
+                      ['sex offender', 'sexual offense', 'registry']):
+                    findings.append({
+                        'type': 'Sex Offender Registry',
+                        'source': result['url'],
+                        'description': result['snippet']
+                    })
+            time.sleep(1)
+        
+        return {
+            'found': len(findings) > 0,
+            'findings': findings
+        }
+
+    def _search_bankruptcy_records(self, person_info: PersonInfo) -> Dict[str, any]:
+        """Search bankruptcy records"""
+        queries = [
+            f'"{person_info.name}" bankruptcy {person_info.region}',
+            f'"{person_info.name}" insolvency {person_info.region}'
+        ]
+        
+        findings = []
+        for query in queries:
+            results = self.search_with_serpapi(query, 2)
+            for result in results:
+                if any(keyword in result.get('snippet', '').lower() for keyword in 
+                      ['bankruptcy', 'insolvency', 'creditor', 'debt']):
+                    findings.append({
+                        'type': 'Bankruptcy Record',
+                        'source': result['url'],
+                        'description': result['snippet']
+                    })
+            time.sleep(1)
+        
+        return {
+            'found': len(findings) > 0,
+            'findings': findings
+        }
+
+    def _search_professional_sanctions(self, person_info: PersonInfo) -> Dict[str, any]:
+        """Search for professional sanctions or disciplinary actions"""
+        queries = [
+            f'"{person_info.name}" professional discipline {person_info.region}',
+            f'"{person_info.name}" license revoked suspended {person_info.region}',
+            f'"{person_info.name}" ethics violation {person_info.region}'
+        ]
+        
+        findings = []
+        for query in queries:
+            results = self.search_with_serpapi(query, 2)
+            for result in results:
+                if any(keyword in result.get('snippet', '').lower() for keyword in 
+                      ['disciplinary', 'sanction', 'license', 'ethics', 'violation']):
+                    findings.append({
+                        'type': 'Professional Sanction',
+                        'source': result['url'],
+                        'description': result['snippet']
+                    })
+            time.sleep(1)
+        
+        return {
+            'found': len(findings) > 0,
+            'findings': findings
+        }
+
+    def _search_legal_news(self, person_info: PersonInfo) -> Dict[str, any]:
+        """Search news articles for legal issues"""
+        queries = [
+            f'"{person_info.name}" lawsuit {person_info.region}',
+            f'"{person_info.name}" legal trouble {person_info.region}',
+            f'"{person_info.name}" fraud charges {person_info.region}'
+        ]
+        
+        findings = []
+        for query in queries:
+            results = self.search_with_serpapi(query, 2)
+            for result in results:
+                if any(keyword in result.get('snippet', '').lower() for keyword in 
+                      ['lawsuit', 'legal', 'charges', 'fraud', 'crime']):
+                    findings.append({
+                        'type': 'Legal News',
+                        'source': result['url'],
+                        'description': result['snippet']
+                    })
+            time.sleep(1)
+        
+        return {
+            'found': len(findings) > 0,
+            'findings': findings
+        }
+
+    def generate_verification_report(self, person_info: PersonInfo, results: VerificationResult) -> str:
+        """Generate a comprehensive verification report"""
+        
+        report_lines = [
+            "=" * 80,
+            f"BACKGROUND VERIFICATION REPORT",
+            "=" * 80,
+            f"Subject: {person_info.name}",
+            f"Region: {person_info.region}",
+            f"Report Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            "EXECUTIVE SUMMARY",
+            "-" * 40,
+            f"Overall Confidence Score: {results.confidence_score:.1%}",
+            f"Verification Status: {'VERIFIED' if results.confidence_score > 0.6 else 'PARTIAL' if results.confidence_score > 0.3 else 'UNVERIFIED'}",
+            ""
+        ]
+
+        # Education Verification
+        report_lines.extend([
+            "EDUCATION VERIFICATION",
+            "-" * 40,
+            f"School: {person_info.school}",
+            f"Verified: {'YES' if results.school_verification.get('verified', False) else 'NO'}",
+            f"Confidence: {results.school_verification.get('confidence', 0):.1%}",
+            f"Sources Used: {', '.join(results.school_verification.get('sources', []))}",
+            ""
+        ])
+
+        # Work Experience Verification
+        report_lines.extend([
+            "WORK EXPERIENCE VERIFICATION",
+            "-" * 40
+        ])
+        
+        for i, work_verify in enumerate(results.work_verification):
+            company = work_verify.get('company', 'Unknown')
+            role = work_verify.get('role', 'Unknown')
+            verified = work_verify.get('verified', False)
+            confidence = work_verify.get('confidence', 0)
+            
+            report_lines.extend([
+                f"Position {i+1}:",
+                f"  Company: {company}",
+                f"  Role: {role}",
+                f"  Verified: {'YES' if verified else 'NO'}",
+                f"  Confidence: {confidence:.1%}",
+                f"  Sources: {', '.join(work_verify.get('sources', []))}",
+                ""
+            ])
+
+        # Criminal Background Check
+        bg_check = results.criminal_background_check
+        report_lines.extend([
+            "CRIMINAL BACKGROUND CHECK",
+            "-" * 40,
+            f"Clean Record: {'YES' if bg_check.get('clean_record', True) else 'NO'}",
+            f"Sources Checked: {', '.join(bg_check.get('sources_checked', []))}",
+            f"Confidence: {bg_check.get('confidence', 0):.1%}",
+            ""
+        ])
+
+        if bg_check.get('findings'):
+            report_lines.append("Findings:")
+            for finding in bg_check['findings']:
+                report_lines.append(f"  - {finding.get('type', 'Unknown')}: {finding.get('description', 'No description')}")
+            report_lines.append("")
+
+        if bg_check.get('warnings'):
+            report_lines.append("Warnings:")
+            for warning in bg_check['warnings']:
+                report_lines.append(f"  - {warning}")
+            report_lines.append("")
+
+        # Social Media Findings
+        report_lines.extend([
+            "SOCIAL MEDIA VERIFICATION",
+            "-" * 40
+        ])
+        
+        for platform, profiles in results.social_media_findings.items():
+            if profiles:
+                report_lines.append(f"{platform.title()}: {len(profiles)} profile(s) found")
+                for profile in profiles[:3]:  # Limit to first 3
+                    report_lines.append(f"  - {profile}")
+            else:
+                report_lines.append(f"{platform.title()}: No profiles found")
+        report_lines.append("")
+
+        # Verification Sources Summary
+        unique_sources = list(set(results.verification_sources))
+        report_lines.extend([
+            "VERIFICATION SOURCES USED",
+            "-" * 40,
+            f"Total Sources: {len(unique_sources)}",
+            "Sources: " + ", ".join(unique_sources),
+            "",
+            "RECOMMENDATIONS",
+            "-" * 40
+        ])
+
+        # Add recommendations based on confidence score
+        if results.confidence_score > 0.8:
+            report_lines.append("✓ High confidence verification - Candidate information appears authentic")
+        elif results.confidence_score > 0.6:
+            report_lines.append("⚠ Good verification - Most information verified, minor gaps present")
+        elif results.confidence_score > 0.3:
+            report_lines.append("⚠ Partial verification - Significant information gaps, further verification recommended")
+        else:
+            report_lines.append("✗ Low confidence - Unable to verify most claims, manual verification strongly recommended")
+
+        report_lines.extend([
+            "",
+            "NEXT STEPS",
+            "-" * 40,
+            "1. Contact provided references directly",
+            "2. Request official transcripts/diplomas for education verification",
+            "3. Perform employment verification calls to HR departments",
+            "4. Consider professional background check service for criminal records",
+            "",
+            "=" * 80,
+            f"End of Report - Generated by Enhanced Resume Verifier v2.0",
+            "=" * 80
+        ])
+
+        return "\n".join(report_lines)
+
+    def save_report_to_file(self, report_content: str, filename: str = "report.txt"):
+        """Save the verification report to a text file"""
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(report_content)
+            logger.info(f"Report saved to {filename}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save report: {e}")
+            return False
+
+    def verify_person(self, person_info: PersonInfo) -> VerificationResult:
+        """Main verification function with comprehensive checks"""
+        logger.info(f"Starting comprehensive verification for {person_info.name}")
+        
+        # Reset verification sources for this person
+        self.verification_sources = []
+        
+        # School verification
+        school_verification = self.verify_education_comprehensive(person_info)
+        
+        # Work verification
+        work_verifications = []
+        for work_exp in person_info.work_experiences:
+            verification = self._verify_work_comprehensive(person_info, work_exp)
+            work_verifications.append(verification)
+        
+        # Criminal background check
+        criminal_check = self.criminal_background_check(person_info)
+        
+        # Social media verification (broader than just LinkedIn)
+        social_media_findings = self._comprehensive_social_search(person_info)
+        
+        # Email templates
+        prepared_emails = self._prepare_emails(person_info)
+        
+        # Calculate overall confidence
+        school_conf = school_verification.get('confidence', 0)
+        work_conf = sum(w.get('confidence', 0) for w in work_verifications) / len(work_verifications) if work_verifications else 0
+        social_conf = self._calculate_social_confidence(social_media_findings)
+        criminal_conf = criminal_check.get('confidence', 0)
+        
+        # Weight the confidence scores
+        overall_confidence = (
+            school_conf * 0.3 +  # 30% weight for education
+            work_conf * 0.4 +    # 40% weight for work experience
+            social_conf * 0.2 +  # 20% weight for social media presence
+            criminal_conf * 0.1  # 10% weight for background check completeness
+        )
+        
+        # Create verification result
+        result = VerificationResult(
+            school_verification=school_verification,
+            work_verification=work_verifications,
+            social_media_findings=social_media_findings,
+            criminal_background_check=criminal_check,
+            prepared_emails=prepared_emails,
+            confidence_score=overall_confidence,
+            verification_sources=list(set(self.verification_sources)),
+            report_summary=""
+        )
+        
+        # Generate comprehensive report
+        report_content = self.generate_verification_report(person_info, result)
+        result.report_summary = report_content
+        
+        # Save report to file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"verification_report_{person_info.name.replace(' ', '_')}_{timestamp}.txt"
+        self.save_report_to_file(report_content, filename)
+        
+        return result
+
+    def _verify_work_comprehensive(self, person_info: PersonInfo, work_exp: Dict[str, str]) -> Dict[str, any]:
+        """Comprehensive work verification using multiple sources"""
+        company = work_exp['company']
+        role = work_exp['role']
+        
+        # Company verification
+        company_verification = self.verify_company_comprehensive(company)
+        
+        # Search for person at company through multiple channels
+        person_work_verification = self._search_person_at_company(person_info, company, role)
+        
+        # Search professional networks beyond LinkedIn
+        professional_verification = self._search_professional_networks(person_info, company, role)
+        
+        # Combine all verification results
+        confidence = 0.0
+        sources = []
+        evidence = []
+        
+        if company_verification.get('verified'):
+            confidence += 0.4
+            sources.extend(company_verification.get('sources', []))
+        
+        if person_work_verification.get('found'):
+            confidence += 0.4
+            sources.extend(person_work_verification.get('sources', []))
+            evidence.extend(person_work_verification.get('evidence', []))
+        
+        if professional_verification.get('found'):
+            confidence += 0.2
+            sources.extend(professional_verification.get('sources', []))
+            evidence.extend(professional_verification.get('evidence', []))
+        
+        return {
             'company': company,
             'role': role,
-            'verified': False,
-            'sources': [],
-            'confidence': 0.0,
-            'evidence': []
+            'verified': confidence > 0.5,
+            'confidence': min(confidence, 1.0),
+            'sources': list(set(sources)),
+            'evidence': evidence,
+            'company_verification': company_verification
+        }
+
+    def _search_person_at_company(self, person_info: PersonInfo, company: str, role: str) -> Dict[str, any]:
+        """Search for evidence of person working at company"""
+        queries = [
+            f'"{person_info.name}" "{company}" {role}',
+            f'"{person_info.name}" "{company}" employee',
+            f'{person_info.name} {company} team member',
+            f'"{person_info.name}" "{company}" staff directory'
+        ]
+        
+        all_evidence = []
+        sources = []
+        
+        for query in queries:
+            results = self.search_with_serpapi(query, 3)
+            for result in results:
+                if self._is_work_relevant(result, person_info.name, company, role):
+                    all_evidence.append(result)
+                    
+                    # Identify source type
+                    url = result.get('url', '').lower()
+                    if 'linkedin' in url:
+                        sources.append('LinkedIn')
+                    elif company.lower().replace(' ', '') in url:
+                        sources.append('Company Website')
+                    elif any(site in url for site in ['crunchbase', 'bloomberg', 'reuters']):
+                        sources.append('Business Directory')
+                    else:
+                        sources.append('Web Search')
+            time.sleep(1)
+        
+        return {
+            'found': len(all_evidence) > 0,
+            'evidence': all_evidence,
+            'sources': list(set(sources))
+        }
+
+    def _search_professional_networks(self, person_info: PersonInfo, company: str, role: str) -> Dict[str, any]:
+        """Search professional networks beyond LinkedIn"""
+        professional_sites = [
+            'site:indeed.com',
+            'site:glassdoor.com',
+            'site:xing.com',
+            'site:researchgate.net',
+            'site:academia.edu',
+            'site:behance.net',
+            'site:dribbble.com',
+            'site:github.com'
+        ]
+        
+        all_evidence = []
+        sources = []
+        
+        for site in professional_sites:
+            query = f'"{person_info.name}" "{company}" {site}'
+            results = self.search_with_serpapi(query, 2)
+            
+            for result in results:
+                if any(word in result.get('snippet', '').lower() for word in company.lower().split()):
+                    all_evidence.append(result)
+                    
+                    # Extract platform name
+                    if 'indeed.com' in result['url']:
+                        sources.append('Indeed')
+                    elif 'glassdoor.com' in result['url']:
+                        sources.append('Glassdoor')
+                    elif 'github.com' in result['url']:
+                        sources.append('GitHub')
+                    # Add other platforms as needed
+            
+            time.sleep(1)
+        
+        return {
+            'found': len(all_evidence) > 0,
+            'evidence': all_evidence,
+            'sources': list(set(sources))
+        }
+
+    def _comprehensive_social_search(self, person_info: PersonInfo) -> Dict[str, List[str]]:
+        """Comprehensive social media search across multiple platforms"""
+        platforms = {
+            'linkedin': 'site:linkedin.com/in',
+            'facebook': 'site:facebook.com',
+            'twitter': 'site:twitter.com OR site:x.com',
+            'instagram': 'site:instagram.com',
+            'youtube': 'site:youtube.com',
+            'github': 'site:github.com',
+            'medium': 'site:medium.com',
+            'personal_websites': f'"{person_info.name}" personal website blog'
         }
         
-        # Improved search queries
-        queries = [
-            f'"{person_name}" "{company}"',
-            f'{person_name} {company} {role}',
-            f'"{person_name}" "{company}" employee',
-            f'{person_name} forum ventures',  # Specific for this case
-            f'{person_name} good news ventures',  # Specific for this case
-        ]
+        findings = {}
         
-        evidence_count = 0
-        
-        for query in queries:
-            try:
-                logger.info(f"Searching work: {query}")
-                results = self.search_bing(query, 8)
-                
-                for result in results:
-                    relevance_score = self._calculate_work_relevance(result, person_name, company, role)
-                    
-                    if relevance_score > 0.3:  # Lower threshold for better results
-                        verification['sources'].append(result['url'])
-                        verification['evidence'].append({
-                            'type': 'work_mention',
-                            'title': result['title'],
-                            'url': result['url'],
-                            'relevance_score': relevance_score
-                        })
-                        evidence_count += 1
-                        logger.info(f"Found work-related result: {result['title'][:60]}...")
-                
-                time.sleep(random.uniform(3, 6))
-                
-            except Exception as e:
-                logger.error(f"Work verification error for query '{query}': {e}")
-        
-        verification['confidence'] = min(evidence_count / 2.0, 1.0)
-        verification['verified'] = verification['confidence'] > 0.3
-        
-        logger.info(f"Work verification complete. Evidence count: {evidence_count}, Confidence: {verification['confidence']:.2%}")
-        return verification
-    
-    def search_linkedin(self, person_name: str, school: str = None, company: str = None) -> List[str]:
-        """Search for LinkedIn profiles with improved method"""
-        logger.info(f"Searching LinkedIn for: {person_name}")
-        
-        findings = []
-        
-        # Use direct site searches
-        results = self.search_direct_sites(person_name, f"{school} {company}" if school and company else "")
-        
-        for result in results:
-            if result.get('source') == 'linkedin':
-                findings.append(result['url'])
-        
-        # Additional Bing search specifically for LinkedIn
-        try:
-            linkedin_query = f'{person_name} site:linkedin.com/in'
-            results = self.search_bing(linkedin_query, 5)
+        for platform, search_term in platforms.items():
+            query = f'"{person_info.name}" {search_term}'
+            results = self.search_with_serpapi(query, 3)
             
+            platform_urls = []
             for result in results:
-                if 'linkedin.com' in result['url'] and result['url'] not in findings:
-                    findings.append(result['url'])
-                    
-        except Exception as e:
-            logger.error(f"LinkedIn search error: {e}")
-        
-        logger.info(f"Found {len(findings)} LinkedIn profiles")
-        return list(set(findings))
-    
-    def search_facebook(self, person_name: str, region: str = None) -> List[str]:
-        """Search for Facebook profiles"""
-        logger.info(f"Searching Facebook for: {person_name}")
-        
-        findings = []
-        
-        try:
-            fb_query = f'{person_name} site:facebook.com'
-            if region:
-                fb_query += f' {region}'
-                
-            results = self.search_bing(fb_query, 5)
+                url = result.get('url', '')
+                if self._is_person_match(result, person_info.name):
+                    platform_urls.append(url)
             
-            for result in results:
-                if 'facebook.com' in result['url']:
-                    findings.append(result['url'])
-                    
+            findings[platform] = platform_urls
+            time.sleep(1)
+        
+        return findings
+
+    def _calculate_social_confidence(self, social_findings: Dict[str, List[str]]) -> float:
+        """Calculate confidence based on social media presence"""
+        total_profiles = sum(len(profiles) for profiles in social_findings.values())
+        professional_profiles = len(social_findings.get('linkedin', [])) + len(social_findings.get('github', []))
+        
+        # Higher weight for professional profiles
+        confidence = min((professional_profiles * 0.3 + total_profiles * 0.1), 1.0)
+        return confidence
+
+    def _is_person_match(self, result: Dict, name: str) -> bool:
+        """Check if search result likely matches the target person"""
+        text = f"{result.get('title', '')} {result.get('snippet', '')}".lower()
+        name_words = name.lower().split()
+        
+        # Check if at least 2 name components match (for common names)
+        matches = sum(1 for word in name_words if word in text and len(word) > 2)
+        return matches >= 2 or (len(name_words) == 1 and name_words[0] in text)
+
+    def _guess_school_domain(self, school_name: str) -> str:
+        """Guess school domain for targeted searches"""
+        # Remove common school suffixes
+        clean_name = school_name.lower()
+        suffixes = ['university', 'college', 'institute', 'school']
+        
+        for suffix in suffixes:
+            clean_name = clean_name.replace(f' {suffix}', '').replace(f'{suffix} ', '')
+        
+        # Replace spaces and common abbreviations
+        domain_guess = clean_name.replace(' ', '').replace('&', 'and') + '.edu'
+        
+        # Handle Canadian schools
+        if any(word in school_name.lower() for word in ['toronto', 'mcgill', 'ubc', 'waterloo']):
+            domain_guess = domain_guess.replace('.edu', '.ca')
+        
+        return domain_guess
+
+    def _guess_company_domain(self, company_name: str) -> str:
+        """Guess company domain for Hunter.io search"""
+        clean_name = company_name.lower()
+        suffixes = ['inc', 'corp', 'corporation', 'company', 'co', 'llc', 'ltd', 'ventures', 'venture', 'capital']
+        
+        for suffix in suffixes:
+            clean_name = clean_name.replace(f' {suffix}', '').replace(f'{suffix} ', '')
+        
+        domain_guess = clean_name.replace(' ', '') + '.com'
+        return domain_guess
+
+    def _fallback_search(self, query: str, num_results: int) -> List[Dict[str, str]]:
+        """Fallback search method using DuckDuckGo Instant Answer API"""
+        try:
+            url = "https://api.duckduckgo.com/"
+            params = {
+                'q': query,
+                'format': 'json',
+                'no_html': '1',
+                'skip_disambig': '1'
+            }
+            
+            response = self.session.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            
+            data = response.json()
+            results = []
+            
+            for result in data.get('Results', [])[:num_results]:
+                if result.get('FirstURL'):
+                    results.append({
+                        'title': result.get('Text', ''),
+                        'url': result.get('FirstURL', ''),
+                        'snippet': result.get('Text', '')
+                    })
+            
+            for topic in data.get('RelatedTopics', [])[:num_results-len(results)]:
+                if isinstance(topic, dict) and topic.get('FirstURL'):
+                    results.append({
+                        'title': topic.get('Text', ''),
+                        'url': topic.get('FirstURL', ''),
+                        'snippet': topic.get('Text', '')
+                    })
+            
+            logger.info(f"Fallback search found {len(results)} results")
+            return results
+            
         except Exception as e:
-            logger.error(f"Facebook search error: {e}")
-        
-        logger.info(f"Found {len(findings)} Facebook profiles")
-        return list(set(findings))
-    
-    def find_supervisor_contact(self, company: str, department: str = None) -> Dict[str, str]:
-        """Attempt to find supervisor contact information"""
-        contacts = {}
-        
-        # Search for company directory or contact information
-        queries = [
-            f'"{company}" contact directory',
-            f'"{company}" team management',
-            f'"{company}" staff directory'
-        ]
-        
-        for query in queries:
-            try:
-                results = self.search_bing(query, 3)
-                for result in results:
-                    contacts[result['url']] = "Manual review required"
-                
-                time.sleep(random.uniform(2, 4))
-                
-            except Exception as e:
-                logger.error(f"Contact search error: {e}")
-        
-        return contacts
-    
-    def prepare_verification_email(self, person_name: str, company: str, role: str, 
-                                  supervisor_email: str = None) -> str:
-        """Prepare email template for supervisor verification"""
-        
-        email_template = f"""
-Subject: Employment Verification Request - {person_name}
+            logger.error(f"Fallback search failed: {e}")
+            return []
 
-Dear Hiring Manager/Supervisor,
+    def _is_education_relevant(self, result: Dict, name: str, school: str) -> bool:
+        """Check if search result is relevant to education verification"""
+        text = f"{result.get('title', '')} {result.get('snippet', '')}".lower()
+        name_words = name.lower().split()
+        school_words = school.lower().split()
+        
+        name_match = any(word in text for word in name_words if len(word) > 2)
+        school_match = any(word in text for word in school_words if len(word) > 3)
+        
+        return name_match and school_match
 
-I hope this email finds you well. I am writing to request employment verification for {person_name}, who has listed {company} as a previous employer on their resume.
+    def _is_work_relevant(self, result: Dict, name: str, company: str, role: str) -> bool:
+        """Check if search result is relevant to work verification"""
+        text = f"{result.get('title', '')} {result.get('snippet', '')}".lower()
+        name_words = name.lower().split()
+        company_words = company.lower().split()
+        
+        name_match = any(word in text for word in name_words if len(word) > 2)
+        company_match = any(word in text for word in company_words if len(word) > 2)
+        
+        return name_match and company_match
+
+    def _prepare_emails(self, person_info: PersonInfo) -> List[str]:
+        """Prepare verification email templates"""
+        emails = []
+        
+        # Education verification email
+        email = f"""
+Subject: Education Verification Request - {person_info.name}
+
+Dear Registrar's Office,
+
+I am conducting an education verification for {person_info.name} who has listed {person_info.school} as their educational institution.
 
 Could you please confirm the following information:
+1. Enrollment dates at {person_info.school}
+2. Degree(s) obtained and graduation date
+3. Field of study/Major
+4. Academic standing (if permissible to share)
 
-1. Employment Period: When did {person_name} work at {company}?
-2. Position Title: Did they hold the position of "{role}" as stated?
-3. Job Performance: Would you be able to provide a brief assessment of their work performance?
-4. Reason for Leaving: What was the reason for their departure?
+This verification is being conducted with the candidate's written consent as part of our standard background check process.
 
-This information is being requested as part of our standard background verification process with the candidate's full consent. All information provided will be kept confidential and used solely for employment verification purposes.
+Please let me know if you need any additional documentation or if there are specific procedures I should follow.
 
-Please feel free to contact me if you have any questions or concerns about this request.
+Thank you for your assistance.
+
+Best regards,
+[Your Name]
+[Your Title]
+[Your Contact Information]
+"""
+        emails.append(email.strip())
+        
+        # Work verification emails
+        for work_exp in person_info.work_experiences:
+            email = f"""
+Subject: Employment Verification Request - {person_info.name}
+
+Dear HR Department / Hiring Manager,
+
+I am conducting employment verification for {person_info.name} who has listed {work_exp['company']} as a previous employer.
+
+Could you please confirm the following information:
+1. Employment dates at {work_exp['company']}
+2. Position held: {work_exp['role']}
+3. Employment status (full-time, part-time, contract)
+4. Reason for departure (if permissible to share)
+5. Eligibility for rehire (if permissible to share)
+
+This verification is being conducted with the candidate's written consent as part of our standard background check process.
+
+If you have a specific employment verification process or forms that need to be completed, please let me know.
 
 Thank you for your time and assistance.
 
 Best regards,
 [Your Name]
 [Your Title]
-[Your Company]
 [Your Contact Information]
-
----
-Note: This is a template email. Please review and modify as needed before sending.
-Supervisor contact: {supervisor_email if supervisor_email else "Contact information not provided - manual search required"}
 """
-        return email_template.strip()
+            emails.append(email.strip())
+        
+        return emails
+
+
+# Configuration class for easy setup
+class VerifierConfig:
+    """Configuration helper for setting up API keys"""
     
-    def verify_person(self, person_info: PersonInfo) -> VerificationResult:
-        """Main verification function"""
-        logger.info(f"Starting verification for {person_info.name}")
-        
-        # School verification
-        school_verification = self.verify_school_attendance(
-            person_info.name, person_info.school, person_info.region
-        )
-        
-        # Work experience verification
-        work_verifications = []
-        for work_exp in person_info.work_experiences:
-            verification = self.verify_work_experience(
-                person_info.name, work_exp['company'], work_exp['role']
-            )
-            work_verifications.append(verification)
-        
-        # Social media search
-        linkedin_profiles = self.search_linkedin(
-            person_info.name, 
-            person_info.school, 
-            person_info.work_experiences[0]['company'] if person_info.work_experiences else None
-        )
-        facebook_profiles = self.search_facebook(person_info.name, person_info.region)
-        
-        social_media_findings = {
-            'linkedin': linkedin_profiles,
-            'facebook': facebook_profiles
+    @staticmethod
+    def get_api_keys_from_env() -> Dict[str, str]:
+        """Load API keys from environment variables"""
+        return {
+            'serp_api': os.getenv('SERP_API_KEY'),
+            'rapidapi': os.getenv('RAPIDAPI_KEY'), 
+            'hunter': os.getenv('HUNTER_API_KEY'),
+            'clearbit': os.getenv('CLEARBIT_API_KEY'),
+            'pipl': os.getenv('PIPL_API_KEY'),
+            'truthfinder': os.getenv('TRUTHFINDER_API_KEY')
         }
-        
-        # Prepare verification emails
-        prepared_emails = []
-        for work_exp in person_info.work_experiences:
-            supervisor_email = None
-            if person_info.supervisor_contacts and 'email' in person_info.supervisor_contacts:
-                supervisor_email = person_info.supervisor_contacts['email']
-            
-            email = self.prepare_verification_email(
-                person_info.name, work_exp['company'], work_exp['role'], supervisor_email
-            )
-            prepared_emails.append(email)
-        
-        # Calculate overall confidence score
-        school_confidence = school_verification['confidence']
-        work_confidence = sum(w['confidence'] for w in work_verifications) / len(work_verifications) if work_verifications else 0
-        social_confidence = min((len(linkedin_profiles) + len(facebook_profiles)) / 3.0, 1.0)
-        
-        overall_confidence = (school_confidence + work_confidence + social_confidence) / 3.0
-        
-        logger.info(f"Verification complete. Overall confidence: {overall_confidence:.2%}")
-        
-        return VerificationResult(
-            school_verification=school_verification,
-            work_verification=work_verifications,
-            social_media_findings=social_media_findings,
-            prepared_emails=prepared_emails,
-            confidence_score=overall_confidence
-        )
     
-    def _get_school_domain(self, school: str) -> str:
-        """Get likely domain for school"""
-        domain_mappings = {
-            'university of toronto': 'utoronto.ca',
-            'uoft': 'utoronto.ca',
-            'university of western': 'uwo.ca',
-            'western university': 'uwo.ca',
-            'harvard': 'harvard.edu',
-            'mit': 'mit.edu',
-            'stanford': 'stanford.edu'
-        }
-        
-        school_lower = school.lower()
-        for key, domain in domain_mappings.items():
-            if key in school_lower:
-                return domain
-        
-        return school.lower().replace(' ', '').replace('university', 'edu').replace('college', 'edu')
-    
-    def _get_company_domain(self, company: str) -> str:
-        """Get likely domain for company"""
-        return company.lower().replace(' ', '').replace('inc', '').replace('corp', '') + '.com'
-    
-    def _calculate_work_relevance(self, result: Dict[str, str], person_name: str, 
-                                 company: str, role: str) -> float:
-        """Calculate relevance score for work-related search results"""
-        title = result['title'].lower()
-        url = result.get('url', '').lower()
-        
-        name_parts = person_name.lower().split()
-        company_parts = company.lower().split()
-        role_parts = role.lower().split()
-        
-        score = 0.0
-        
-        # Check for name matches
-        name_matches = sum(1 for part in name_parts if part in title and len(part) > 2)
-        if name_matches > 0:
-            score += 0.4 * (name_matches / len(name_parts))
-        
-        # Check for company matches
-        company_matches = sum(1 for part in company_parts if part in title and len(part) > 2)
-        if company_matches > 0:
-            score += 0.4 * (company_matches / len(company_parts))
-        
-        # Check for role matches
-        role_matches = sum(1 for part in role_parts if part in title and len(part) > 2)
-        if role_matches > 0:
-            score += 0.2 * (role_matches / len(role_parts))
-        
-        # Bonus for LinkedIn profiles
-        if 'linkedin.com' in url:
-            score += 0.2
-        
-        return min(score, 1.0)
-    
-    def generate_report(self, person_info: PersonInfo, result: VerificationResult) -> str:
-        """Generate a comprehensive verification report"""
-        report = f"""
-RESUME VERIFICATION REPORT
-==========================
+    @staticmethod
+    def print_setup_instructions():
+        """Print instructions for getting API keys"""
+        print("""
+ENHANCED API SETUP INSTRUCTIONS:
+================================
 
-Candidate: {person_info.name}
-Region: {person_info.region}
-Date Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}
+SEARCH & VERIFICATION APIs:
+1. SerpApi (Google Search) - FREE TIER: 100 searches/month
+   - Go to: https://serpapi.com/
+   - Sign up and get API key
+   - Set: SERP_API_KEY=your_key_here
 
-OVERALL CONFIDENCE SCORE: {result.confidence_score:.2%}
+2. Hunter.io (Company & Email Verification) - FREE TIER: 50 requests/month
+   - Go to: https://hunter.io/
+   - Sign up and get API key
+   - Set: HUNTER_API_KEY=your_key_here
 
-EDUCATION VERIFICATION
-----------------------
-School: {person_info.school}
-Verified: {'YES' if result.school_verification['verified'] else 'NO'}
-Confidence: {result.school_verification['confidence']:.2%}
-Sources Found: {len(result.school_verification['sources'])}
+PROFESSIONAL VERIFICATION APIs:
+3. RapidAPI (Multiple Services) - FREE TIER available
+   - Go to: https://rapidapi.com/
+   - Search for verification APIs
+   - Set: RAPIDAPI_API_KEY=your_key_here
 
-Evidence:
-"""
-        
-        for evidence in result.school_verification['evidence']:
-            report += f"  - {evidence['title']}\n    URL: {evidence['url']}\n"
-        
-        if not result.school_verification['evidence']:
-            report += "  - No direct evidence found in automated search\n"
-        
-        report += f"""
-WORK EXPERIENCE VERIFICATION
------------------------------
-"""
-        
-        for i, work_verification in enumerate(result.work_verification):
-            report += f"""
-Experience {i+1}:
-Company: {work_verification['company']}
-Role: {work_verification['role']}
-Verified: {'YES' if work_verification['verified'] else 'NO'}
-Confidence: {work_verification['confidence']:.2%}
-Sources Found: {len(work_verification['sources'])}
+4. Clearbit (Company Information) - FREE TIER: 50 requests/month
+   - Go to: https://clearbit.com/
+   - Sign up for free tier
+   - Set: CLEARBIT_API_KEY=your_key_here
 
-Evidence:
-"""
-            for evidence in work_verification['evidence']:
-                report += f"  - {evidence['title']}\n    URL: {evidence['url']}\n    Relevance: {evidence.get('relevance_score', 'N/A')}\n"
-            
-            if not work_verification['evidence']:
-                report += "  - No direct evidence found in automated search\n"
-        
-        report += f"""
-SOCIAL MEDIA PRESENCE
----------------------
-LinkedIn Profiles Found: {len(result.social_media_findings['linkedin'])}
-"""
-        for profile in result.social_media_findings['linkedin']:
-            report += f"  - {profile}\n"
-        
-        report += f"""
-Facebook Profiles Found: {len(result.social_media_findings['facebook'])}
-"""
-        for profile in result.social_media_findings['facebook']:
-            report += f"  - {profile}\n"
-        
-        report += f"""
-PREPARED VERIFICATION EMAILS
------------------------------
-{len(result.prepared_emails)} email(s) prepared for supervisor verification.
-See separate email templates below.
+BACKGROUND CHECK APIs (Optional):
+5. Pipl (People Search) - PAID SERVICE
+   - Go to: https://pipl.com/
+   - Professional people search API
+   - Set: PIPL_API_KEY=your_key_here
 
-RECOMMENDATIONS
----------------
-"""
-        if result.confidence_score > 0.7:
-            report += "- HIGH CONFIDENCE: Multiple sources verify the candidate's claims.\n"
-        elif result.confidence_score > 0.4:
-            report += "- MODERATE CONFIDENCE: Some verification found, recommend manual review.\n"
-        else:
-            report += "- LOW CONFIDENCE: Limited verification found, recommend thorough manual investigation.\n"
-        
-        report += "- Review all provided URLs manually for context and accuracy.\n"
-        report += "- Consider contacting provided references and supervisors.\n"
-        report += "- This automated check supplements but does not replace human verification.\n"
-        report += "- Web scraping results may be limited due to anti-bot measures.\n"
-        report += "- Consider using professional background check services for comprehensive verification.\n"
-        
-        return report
+6. TruthFinder API - PAID SERVICE
+   - Go to: https://www.truthfinder.com/
+   - Background check service
+   - Set: TRUTHFINDER_API_KEY=your_key_here
+
+ALTERNATIVE FREE SERVICES:
+- Companies House API (UK): https://developer.company-information.service.gov.uk/
+- SEC EDGAR API (US): https://www.sec.gov/edgar/sec-api-documentation
+- OpenCorporates API: https://api.opencorporates.com/
+
+USAGE EXAMPLE:
+==============
+from enhanced_resume_verifier import EnhancedResumeVerifier, PersonInfo, VerifierConfig
+
+# Setup
+api_keys = VerifierConfig.get_api_keys_from_env()
+verifier = EnhancedResumeVerifier(api_keys)
+
+# Create person info
+person = PersonInfo(
+    name="John Doe",
+    region="Ontario, Canada",
+    school="University of Toronto",
+    work_experiences=[
+        {"company": "Tech Corp", "role": "Software Engineer"},
+        {"company": "Finance Inc", "role": "Data Analyst"}
+    ],
+    date_of_birth="1990-01-01",  # Optional, for better criminal record matching
+    ssn_last_4="1234"           # Optional, for US residents
+)
+
+# Run verification
+results = verifier.verify_person(person)
+
+# Report will be automatically saved as 'verification_report_John_Doe_YYYYMMDD_HHMMSS.txt'
+print(f"Verification completed with {results.confidence_score:.1%} confidence")
+print(f"Report saved with {len(results.verification_sources)} sources checked")
+""")
+
+
